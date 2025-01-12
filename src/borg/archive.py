@@ -719,6 +719,66 @@ Duration: {0.duration}
                 # In this case, we *want* to extract twice, because there is no other way.
                 pass
 
+    def compare_and_extract_chunks(self, item, fs_path):
+        fs_path = os.path.normpath(fs_path.replace(self.cwd + os.sep, "", 1))
+        fs_path = os.path.join(self.cwd, fs_path)
+        print(f"Starting chunk comparison for {fs_path}")
+        os.makedirs(os.path.dirname(fs_path), exist_ok=True)
+        try:
+            if os.path.isfile(fs_path):
+                with open(fs_path, "rb+") as fs_file:
+                    chunk_offset = 0
+                    for chunk_entry in item.chunks:
+                        chunkid_A = chunk_entry.id
+                        size = chunk_entry.size
+
+                        fs_file.seek(chunk_offset)
+                        data_F = fs_file.read(size)
+
+                        if len(data_F) == size:
+                            chunkid_F = self.key.id_hash(data_F)
+                            if chunkid_A != chunkid_F:
+                                fs_file.seek(chunk_offset)  # Go back to the start of the chunk
+                                chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
+                                fs_file.write(chunk_data)
+                        else:
+                            fs_file.seek(chunk_offset)
+                            chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
+                            fs_file.write(chunk_data)
+
+                        chunk_offset += size
+
+                    fs_file.truncate(item.size)
+            else:
+                with open(fs_path, "wb") as fs_file:
+                    for chunk_entry in item.chunks:
+                        chunk_data = b"".join(self.pipeline.fetch_many([chunk_entry.id], ro_type=ROBJ_FILE_STREAM))
+                        fs_file.write(chunk_data)
+                    fs_file.truncate(item.size)
+
+            total_size = 0
+            chunk_size = 8192
+            with open(fs_path, "rb") as fs_file:
+                while True:
+                    chunk = fs_file.read(chunk_size)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > item.size:
+                        break
+
+                fs_file.seek(0)
+                preview = fs_file.read(50)
+                print(f"Final file size: {total_size}, Expected: {item.size}")
+                print(f"Content preview (text): {preview.decode('utf-8', errors='replace')}")
+
+        except OSError as e:
+            print(f"IO error processing {fs_path}: {e}")
+            raise
+        except Exception as e:
+            print(f"Error processing {fs_path}: {str(e)}")
+            raise
+
     def extract_item(
         self,
         item,
@@ -730,6 +790,7 @@ Duration: {0.duration}
         hlm=None,
         pi=None,
         continue_extraction=False,
+        check_existing=False,
     ):
         """
         Extract archive item.
@@ -742,6 +803,7 @@ Duration: {0.duration}
         :param hlm: maps hlid to link_target for extracting subtrees with hardlinks correctly
         :param pi: ProgressIndicatorPercent (or similar) for file extraction progress (in bytes)
         :param continue_extraction: continue a previously interrupted extraction of same archive
+        :param check_existing: check against existing file/block device and only retrieve changed data
         """
 
         def same_item(item, st):
@@ -761,6 +823,16 @@ Duration: {0.duration}
             # there is a very small risk that "bsdflags" of one file are wrong:
             # if a previous extraction was interrupted between setting the mtime and setting non-default flags.
             return True
+
+        if check_existing:
+            dest = os.path.normpath(self.cwd)
+            fs_path = os.path.join(dest, item.path)
+
+            if not os.path.normpath(fs_path).startswith(dest):
+                raise Exception(f"Path {fs_path} is outside of extraction directory {dest}")
+
+            self.compare_and_extract_chunks(item, fs_path)
+            return
 
         has_damaged_chunks = "chunks_healthy" in item
         if dry_run or stdout:
