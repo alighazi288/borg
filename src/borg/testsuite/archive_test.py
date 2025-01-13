@@ -132,6 +132,11 @@ class MockCache:
         self.objects[id] = data
         return id, len(data)
 
+    def fetch_many(self, ids, ro_type=None):
+        """Mock implementation of fetch_many"""
+        for id in ids:
+            yield self.objects[id]
+
 
 def test_cache_chunk_buffer():
     data = [Item(path="p1"), Item(path="p2")]
@@ -402,3 +407,134 @@ def test_reject_non_sanitized_item():
     for path in rejected_dotdot_paths:
         with pytest.raises(ValueError, match="unexpected '..' element in path"):
             Item(path=path, user="root", group="root")
+
+
+def test_compare_and_extract_chunks(tmpdir, monkeypatch):
+    """Test chunk comparison and selective extraction with fixed-size chunks"""
+    # Setup mock repository and key
+    repository = Mock()
+    key = PlaintextKey(repository)
+    manifest = Manifest(key, repository)
+
+    cache = MockCache()
+
+    # Create a test file with known content divided into 512-byte chunks
+    chunk_size = 512
+    test_data = b"block" * 128  # 640 bytes - will create 2 chunks
+    original_file = tmpdir.join("test.txt")
+    original_file.write_binary(test_data)
+
+    # Create mock item with chunks
+    chunks = []
+    for i in range(0, len(test_data), chunk_size):
+        chunk_data = test_data[i : i + chunk_size]
+        chunk_id = key.id_hash(chunk_data)
+        chunks.append(Mock(id=chunk_id, size=len(chunk_data)))
+        cache.objects[chunk_id] = chunk_data
+
+    item = Mock(chunks=chunks, size=len(test_data))
+
+    # Test case 1: File doesn't exist (full extraction)
+    extractor = Archive(manifest=manifest, name="test", create=True)
+    extractor.pipeline = cache
+    extractor.key = key
+    extractor.cwd = str(tmpdir)
+
+    target_path = str(tmpdir.join("extracted.txt"))
+    extractor.compare_and_extract_chunks(item, target_path)
+
+    with open(target_path, "rb") as f:
+        assert f.read() == test_data
+
+    # Test case 2: File exists with partially matching chunks
+    modified_data = test_data[:256] + b"modified" + test_data[264:]
+    with open(target_path, "wb") as f:
+        f.write(modified_data)
+
+    extractor.compare_and_extract_chunks(item, target_path)
+
+    with open(target_path, "rb") as f:
+        extracted = f.read()
+        assert extracted == test_data
+        assert extracted != modified_data
+
+    # Test case 3: File exists with all matching chunks
+    extractor.compare_and_extract_chunks(item, target_path)
+    with open(target_path, "rb") as f:
+        assert f.read() == test_data
+
+
+def test_compare_and_extract_chunks_size_mismatch(tmpdir):
+    """Test chunk comparison when file size doesn't match chunk size"""
+    repository = Mock()
+    key = PlaintextKey(repository)
+    manifest = Manifest(key, repository)
+
+    cache = MockCache()
+
+    # Create a smaller file than expected
+    test_data = b"block" * 64  # 320 bytes
+    expected_data = b"block" * 128  # 640 bytes
+
+    original_file = tmpdir.join("test.txt")
+    original_file.write_binary(test_data)
+
+    # Create mock item with chunks expecting larger size
+    chunks = []
+    for i in range(0, len(expected_data), 512):
+        chunk_data = expected_data[i : i + 512]
+        chunk_id = key.id_hash(chunk_data)
+        chunks.append(Mock(id=chunk_id, size=len(chunk_data)))
+        cache.objects[chunk_id] = chunk_data
+
+    item = Mock(chunks=chunks, size=len(expected_data))
+
+    # Test extraction
+    extractor = Archive(manifest=manifest, name="test", create=True)
+    extractor.pipeline = cache
+    extractor.key = key
+    extractor.cwd = str(tmpdir)
+
+    target_path = str(original_file)
+    extractor.compare_and_extract_chunks(item, target_path)
+
+    with open(target_path, "rb") as f:
+        assert f.read() == expected_data
+
+
+def test_compare_and_extract_chunks_partial_chunk(tmpdir):
+    """Test chunk comparison with a final partial chunk"""
+    repository = Mock()
+    key = PlaintextKey(repository)
+    manifest = Manifest(key, repository)
+
+    cache = MockCache()
+
+    # Create data that doesn't align with chunk boundaries
+    chunk_size = 512
+    test_data = b"block" * 130  # 650 bytes - will create 2 chunks, second one partial
+
+    original_file = tmpdir.join("test.txt")
+    original_file.write_binary(test_data)
+
+    # Create mock item with chunks
+    chunks = []
+    for i in range(0, len(test_data), chunk_size):
+        chunk_data = test_data[i : i + chunk_size]
+        chunk_id = key.id_hash(chunk_data)
+        chunks.append(Mock(id=chunk_id, size=len(chunk_data)))
+        cache.objects[chunk_id] = chunk_data
+
+    item = Mock(chunks=chunks, size=len(test_data))
+
+    # Test extraction
+    extractor = Archive(manifest=manifest, name="test", create=True)
+    extractor.pipeline = cache
+    extractor.key = key
+    extractor.cwd = str(tmpdir)
+
+    target_path = str(tmpdir.join("extracted.txt"))
+    extractor.compare_and_extract_chunks(item, target_path)
+
+    with open(target_path, "rb") as f:
+        assert f.read() == test_data

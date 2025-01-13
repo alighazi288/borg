@@ -720,9 +720,17 @@ Duration: {0.duration}
                 pass
 
     def compare_and_extract_chunks(self, item, fs_path):
-        fs_path = os.path.normpath(fs_path.replace(self.cwd + os.sep, "", 1))
-        fs_path = os.path.join(self.cwd, fs_path)
-        print(f"Starting chunk comparison for {fs_path}")
+        print(f"Initial fs_path: {fs_path}")
+        print(f"self.cwd: {self.cwd}")
+        if fs_path.startswith(self.cwd):
+            fs_path = fs_path[len(self.cwd) :].lstrip(os.sep)
+        print(f"Relative fs_path: {fs_path}")
+
+        # Construct the final path
+        fs_path = os.path.normpath(os.path.join(self.cwd, fs_path))
+        print(f"Final fs_path: {fs_path}")
+        print(f"File exists at final path: {os.path.isfile(fs_path)}")
+
         os.makedirs(os.path.dirname(fs_path), exist_ok=True)
         try:
             if os.path.isfile(fs_path):
@@ -731,17 +739,29 @@ Duration: {0.duration}
                     for chunk_entry in item.chunks:
                         chunkid_A = chunk_entry.id
                         size = chunk_entry.size
+                        print(f"Processing chunk at offset {chunk_offset}")
 
                         fs_file.seek(chunk_offset)
                         data_F = fs_file.read(size)
+                        print(f"Read {len(data_F)} bytes at offset {chunk_offset}")
+                        print(f"File content: {data_F[:20]}...")  # Show first 20 bytes
 
                         if len(data_F) == size:
                             chunkid_F = self.key.id_hash(data_F)
+                            print("Comparing hashes:")  # Debug
+                            print(f"Archive hash: {chunkid_A.hex()}")  # Debug
+                            print(f"File hash: {chunkid_F.hex()}")  # Debug
+                            print(f"Hashes match? {chunkid_A == chunkid_F}")
                             if chunkid_A != chunkid_F:
+                                print("Hashes don't match, fetching new chunk")  # Debug
                                 fs_file.seek(chunk_offset)  # Go back to the start of the chunk
                                 chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
+                                print(f"Fetched content: {chunk_data[:20]}...")
                                 fs_file.write(chunk_data)
+                                fs_file.flush()
+                                print("Wrote and flushed new chunk data")
                         else:
+                            print(f"Chunk size mismatch at offset {chunk_offset}")
                             fs_file.seek(chunk_offset)
                             chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
                             fs_file.write(chunk_data)
@@ -749,6 +769,9 @@ Duration: {0.duration}
                         chunk_offset += size
 
                     fs_file.truncate(item.size)
+                    print(f"\nFinal file size: {os.path.getsize(fs_path)}")
+                    with open(fs_path, "rb") as f:
+                        print(f"Final content: {f.read()[:20]}...")
             else:
                 with open(fs_path, "wb") as fs_file:
                     for chunk_entry in item.chunks:
@@ -756,20 +779,9 @@ Duration: {0.duration}
                         fs_file.write(chunk_data)
                     fs_file.truncate(item.size)
 
-            total_size = 0
-            chunk_size = 8192
             with open(fs_path, "rb") as fs_file:
-                while True:
-                    chunk = fs_file.read(chunk_size)
-                    if not chunk:
-                        break
-                    total_size += len(chunk)
-                    if total_size > item.size:
-                        break
-
-                fs_file.seek(0)
                 preview = fs_file.read(50)
-                print(f"Final file size: {total_size}, Expected: {item.size}")
+                print(f"Final file size: {os.path.getsize(fs_path)}, Expected: {item.size}")
                 print(f"Content preview (text): {preview.decode('utf-8', errors='replace')}")
 
         except OSError as e:
