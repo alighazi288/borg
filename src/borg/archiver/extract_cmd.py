@@ -44,7 +44,6 @@ class ExtractMixIn:
         sparse = args.sparse
         strip_components = args.strip_components
         continue_extraction = args.continue_extraction
-        check_existing = args.check_existing
         dirs = []
         hlm = HardLinkManager(id_type=bytes, info_type=str)  # hlid -> path
 
@@ -97,7 +96,6 @@ class ExtractMixIn:
                                 hlm=hlm,
                                 pi=pi,
                                 continue_extraction=continue_extraction,
-                                check_existing=check_existing,
                             )
                 except BackupError as e:
                     self.print_warning_instance(BackupWarning(remove_surrogates(orig_path), e))
@@ -193,12 +191,6 @@ class ExtractMixIn:
             dest="continue_extraction",
             action="store_true",
             help="continue a previously interrupted extraction of same archive",
-        )
-        subparser.add_argument(
-            "--check-existing",
-            dest="check_existing",
-            action="store_true",
-            help="check against existing file/block device and only retrieve changed data",
         )
         subparser.add_argument("name", metavar="NAME", type=archivename_validator, help="specify the archive name")
         subparser.add_argument(

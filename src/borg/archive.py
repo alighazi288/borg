@@ -720,76 +720,38 @@ Duration: {0.duration}
                 pass
 
     def compare_and_extract_chunks(self, item, fs_path):
-        print(f"Initial fs_path: {fs_path}")
-        print(f"self.cwd: {self.cwd}")
-        if fs_path.startswith(self.cwd):
-            fs_path = fs_path[len(self.cwd) :].lstrip(os.sep)
-        print(f"Relative fs_path: {fs_path}")
-
-        # Construct the final path
-        fs_path = os.path.normpath(os.path.join(self.cwd, fs_path))
-        print(f"Final fs_path: {fs_path}")
-        print(f"File exists at final path: {os.path.isfile(fs_path)}")
-
-        os.makedirs(os.path.dirname(fs_path), exist_ok=True)
+        """Compare file chunks and patch if needed. Returns True if patching succeeded."""
         try:
-            if os.path.isfile(fs_path):
-                with open(fs_path, "rb+") as fs_file:
-                    chunk_offset = 0
-                    for chunk_entry in item.chunks:
-                        chunkid_A = chunk_entry.id
-                        size = chunk_entry.size
-                        print(f"Processing chunk at offset {chunk_offset}")
+            st = os.stat(fs_path, follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode):
+                return False
 
+            with open(fs_path, "rb+") as fs_file:
+                chunk_offset = 0
+                for chunk_entry in item.chunks:
+                    chunkid_A = chunk_entry.id
+                    size = chunk_entry.size
+
+                    fs_file.seek(chunk_offset)
+                    data_F = fs_file.read(size)
+
+                    needs_update = True
+                    if len(data_F) == size:
+                        chunkid_F = self.key.id_hash(data_F)
+                        needs_update = chunkid_A != chunkid_F
+
+                    if needs_update:
+                        chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
                         fs_file.seek(chunk_offset)
-                        data_F = fs_file.read(size)
-                        print(f"Read {len(data_F)} bytes at offset {chunk_offset}")
-                        print(f"File content: {data_F[:20]}...")  # Show first 20 bytes
-
-                        if len(data_F) == size:
-                            chunkid_F = self.key.id_hash(data_F)
-                            print("Comparing hashes:")  # Debug
-                            print(f"Archive hash: {chunkid_A.hex()}")  # Debug
-                            print(f"File hash: {chunkid_F.hex()}")  # Debug
-                            print(f"Hashes match? {chunkid_A == chunkid_F}")
-                            if chunkid_A != chunkid_F:
-                                print("Hashes don't match, fetching new chunk")  # Debug
-                                fs_file.seek(chunk_offset)  # Go back to the start of the chunk
-                                chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
-                                print(f"Fetched content: {chunk_data[:20]}...")
-                                fs_file.write(chunk_data)
-                                fs_file.flush()
-                                print("Wrote and flushed new chunk data")
-                        else:
-                            print(f"Chunk size mismatch at offset {chunk_offset}")
-                            fs_file.seek(chunk_offset)
-                            chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
-                            fs_file.write(chunk_data)
-
-                        chunk_offset += size
-
-                    fs_file.truncate(item.size)
-                    print(f"\nFinal file size: {os.path.getsize(fs_path)}")
-                    with open(fs_path, "rb") as f:
-                        print(f"Final content: {f.read()[:20]}...")
-            else:
-                with open(fs_path, "wb") as fs_file:
-                    for chunk_entry in item.chunks:
-                        chunk_data = b"".join(self.pipeline.fetch_many([chunk_entry.id], ro_type=ROBJ_FILE_STREAM))
                         fs_file.write(chunk_data)
-                    fs_file.truncate(item.size)
 
-            with open(fs_path, "rb") as fs_file:
-                preview = fs_file.read(50)
-                print(f"Final file size: {os.path.getsize(fs_path)}, Expected: {item.size}")
-                print(f"Content preview (text): {preview.decode('utf-8', errors='replace')}")
+                    chunk_offset += size
 
-        except OSError as e:
-            print(f"IO error processing {fs_path}: {e}")
-            raise
-        except Exception as e:
-            print(f"Error processing {fs_path}: {str(e)}")
-            raise
+                fs_file.truncate(item.size)
+                return True
+
+        except (OSError, Exception):
+            return False
 
     def extract_item(
         self,
@@ -802,7 +764,6 @@ Duration: {0.duration}
         hlm=None,
         pi=None,
         continue_extraction=False,
-        check_existing=False,
     ):
         """
         Extract archive item.
@@ -815,7 +776,6 @@ Duration: {0.duration}
         :param hlm: maps hlid to link_target for extracting subtrees with hardlinks correctly
         :param pi: ProgressIndicatorPercent (or similar) for file extraction progress (in bytes)
         :param continue_extraction: continue a previously interrupted extraction of same archive
-        :param check_existing: check against existing file/block device and only retrieve changed data
         """
 
         def same_item(item, st):
@@ -835,16 +795,6 @@ Duration: {0.duration}
             # there is a very small risk that "bsdflags" of one file are wrong:
             # if a previous extraction was interrupted between setting the mtime and setting non-default flags.
             return True
-
-        if check_existing:
-            dest = os.path.normpath(self.cwd)
-            fs_path = os.path.join(dest, item.path)
-
-            if not os.path.normpath(fs_path).startswith(dest):
-                raise Exception(f"Path {fs_path} is outside of extraction directory {dest}")
-
-            self.compare_and_extract_chunks(item, fs_path)
-            return
 
         has_damaged_chunks = "chunks_healthy" in item
         if dry_run or stdout:
@@ -905,6 +855,9 @@ Duration: {0.duration}
             with self.extract_helper(item, path, hlm) as hardlink_set:
                 if hardlink_set:
                     return
+                if self.compare_and_extract_chunks(item, path):
+                    return
+
                 with backup_io("open"):
                     fd = open(path, "wb")
                 with fd:
