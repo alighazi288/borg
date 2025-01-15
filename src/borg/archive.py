@@ -719,38 +719,82 @@ Duration: {0.duration}
                 # In this case, we *want* to extract twice, because there is no other way.
                 pass
 
-    def compare_and_extract_chunks(self, item, fs_path):
+    def compare_and_extract_chunks(self, item, fs_path, st=None, *, pi=None, sparse=False):
         """Compare file chunks and patch if needed. Returns True if patching succeeded."""
+        if st is None or not stat.S_ISREG(st.st_mode):
+            return False
+
         try:
-            st = os.stat(fs_path, follow_symlinks=False)
-            if not stat.S_ISREG(st.st_mode):
-                return False
+            # First pass: Build fs chunks list
+            fs_chunks = []
+            offset = 0
+            with backup_io("open"):
+                fs_file = open(fs_path, "rb")
+            with fs_file:
+                for chunk in item.chunks:
+                    with backup_io("seek"):
+                        fs_file.seek(offset)
+                    with backup_io("read"):
+                        data = fs_file.read(chunk.size)
+                    if len(data) != chunk.size:
+                        fs_chunks.append(None)
+                    else:
+                        fs_chunks.append(ChunkListEntry(id=self.key.id_hash(data), size=chunk.size))
+                    offset += chunk.size
 
-            with open(fs_path, "rb+") as fs_file:
-                chunk_offset = 0
-                for chunk_entry in item.chunks:
-                    chunkid_A = chunk_entry.id
-                    size = chunk_entry.size
+            # Compare chunks and collect needed chunk IDs
+            needed_chunks = []
+            for fs_chunk, item_chunk in zip(fs_chunks, item.chunks):
+                if fs_chunk is None or fs_chunk.id != item_chunk.id:
+                    needed_chunks.append(item_chunk)
 
-                    fs_file.seek(chunk_offset)
-                    data_F = fs_file.read(size)
-
-                    needs_update = True
-                    if len(data_F) == size:
-                        chunkid_F = self.key.id_hash(data_F)
-                        needs_update = chunkid_A != chunkid_F
-
-                    if needs_update:
-                        chunk_data = b"".join(self.pipeline.fetch_many([chunkid_A], ro_type=ROBJ_FILE_STREAM))
-                        fs_file.seek(chunk_offset)
-                        fs_file.write(chunk_data)
-
-                    chunk_offset += size
-
-                fs_file.truncate(item.size)
+            if not needed_chunks:
                 return True
 
-        except (OSError, Exception):
+            # Fetch all needed chunks and iterate through ALL of them
+            chunk_data_iter = self.pipeline.fetch_many(
+                [chunk.id for chunk in needed_chunks], is_preloaded=True, ro_type=ROBJ_FILE_STREAM
+            )
+
+            # Second pass: Update file and consume EVERY chunk from the iterator
+            offset = 0
+            item_chunk_size = 0
+            with backup_io("open"):
+                fs_file = open(fs_path, "rb+")
+            with fs_file:
+                for fs_chunk, item_chunk in zip(fs_chunks, item.chunks):
+                    with backup_io("seek"):
+                        fs_file.seek(offset)
+                    if fs_chunk is not None and fs_chunk.id == item_chunk.id:
+                        offset += item_chunk.size
+                        item_chunk_size += item_chunk.size
+                    else:
+                        chunk_data = next(chunk_data_iter)
+                        if pi:
+                            pi.show(increase=len(chunk_data), info=[remove_surrogates(item.path)])
+                        with backup_io("write"):
+                            if sparse and not chunk_data.strip(b"\0"):
+                                fs_file.seek(len(chunk_data), 1)  # Seek over sparse section
+                                offset += len(chunk_data)
+                            else:
+                                fs_file.write(chunk_data)
+                                offset += len(chunk_data)
+                            item_chunk_size += len(chunk_data)
+                with backup_io("truncate_and_attrs"):
+                    fs_file.truncate(item.size)
+                    fs_file.flush()
+                    self.restore_attrs(fs_path, item, fd=fs_file.fileno())
+
+            # Size verification like extract_item
+            if "size" in item and item.size != item_chunk_size:
+                raise BackupError(f"Size inconsistency detected: size {item.size}, chunks size {item_chunk_size}")
+
+            # Damaged chunks check like extract_item
+            if "chunks_healthy" in item and not item.chunks_healthy:
+                raise BackupError("File has damaged (all-zero) chunks. Try running borg check --repair.")
+
+            return True
+        except OSError:
             return False
 
     def extract_item(
@@ -855,7 +899,7 @@ Duration: {0.duration}
             with self.extract_helper(item, path, hlm) as hardlink_set:
                 if hardlink_set:
                     return
-                if self.compare_and_extract_chunks(item, path):
+                if self.compare_and_extract_chunks(item, path, pi=pi, sparse=sparse):
                     return
 
                 with backup_io("open"):

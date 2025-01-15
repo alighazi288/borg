@@ -426,27 +426,31 @@ def setup_extractor(tmpdir):
     extractor.pipeline = cache
     extractor.key = key
     extractor.cwd = str(tmpdir)
+    extractor.restore_attrs = Mock()
 
     # Track fetched chunks across tests
     fetched_chunks = []
 
-    def create_mock_chunks(test_data, chunk_size=512):
-        """Helper function to create mock chunks from test data"""
+    def create_mock_chunks(item_data, chunk_size=4):
+        """Helper function to create mock chunks from archive data"""
         chunks = []
-        for i in range(0, len(test_data), chunk_size):
-            chunk_data = test_data[i : i + chunk_size]
+        for i in range(0, len(item_data), chunk_size):
+            chunk_data = item_data[i : i + chunk_size]
             chunk_id = key.id_hash(chunk_data)
             chunks.append(Mock(id=chunk_id, size=len(chunk_data)))
             cache.objects[chunk_id] = chunk_data
 
-        item = Mock(chunks=chunks, size=len(test_data))
-        target_path = str(tmpdir.join("test.txt"))
-        return item, target_path
+        item = Mock(spec=["chunks", "size", "__contains__", "get"])
+        item.chunks = chunks  # Use actual list for chunks
+        item.size = len(item_data)
+        item.__contains__ = lambda self, item: item == "size"
 
-    def mock_fetch_many(chunk_ids, ro_type):
+        return item, str(tmpdir.join("test.txt"))
+
+    def mock_fetch_many(chunk_ids, is_preloaded=True, ro_type=None):
         """Helper function to track and mock chunk fetching"""
         fetched_chunks.extend(chunk_ids)
-        return [cache.objects[chunk_id] for chunk_id in chunk_ids]
+        return iter([cache.objects[chunk_id] for chunk_id in chunk_ids])
 
     def clear_fetched_chunks():
         """Helper function to clear tracked chunks between tests"""
@@ -462,99 +466,85 @@ def setup_extractor(tmpdir):
 
 
 @pytest.mark.parametrize(
-    "name, test_data, initial_data, expected_fetched_chunks, expected_success",
+    "name, item_data, fs_data, expected_fetched_chunks",
     [
         (
             "no_changes",
-            b"A" * 512,  # One complete chunk, no changes needed
-            b"A" * 512,  # Identical content
+            b"1111",  # One complete chunk, no changes needed
+            b"1111",  # Identical content
             0,  # No chunks should be fetched
-            True,
         ),
         (
             "single_chunk_change",
-            b"A" * 512 + b"B" * 512,  # Two chunks
-            b"A" * 512 + b"X" * 512,  # Second chunk different
+            b"11112222",  # Two chunks
+            b"1111XXXX",  # Second chunk different
             1,  # Only second chunk should be fetched
-            True,
         ),
         (
             "cross_boundary_change",
-            b"A" * 512 + b"B" * 512,  # Two chunks
-            b"A" * 500 + b"X" * 24,  # Change crosses chunk boundary
+            b"11112222",  # Two chunks
+            b"111XX22",  # Change crosses chunk boundary
             2,  # Both chunks need update
-            True,
         ),
         (
             "exact_multiple_chunks",
-            b"A" * 512 + b"B" * 512 + b"C" * 512,  # Three complete chunks
-            b"A" * 512 + b"X" * 512 + b"C" * 512,  # Middle chunk different
+            b"11112222333",  # Three chunks (last one partial)
+            b"1111XXXX333",  # Middle chunk different
             1,  # Only middle chunk fetched
-            True,
         ),
         (
             "first_chunk_change",
-            b"A" * 512 + b"B" * 512,  # Two chunks
-            b"X" * 512 + b"B" * 512,  # First chunk different
+            b"11112222",  # Two chunks
+            b"XXXX2222",  # First chunk different
             1,  # Only first chunk should be fetched
-            True,
         ),
         (
             "all_chunks_different",
-            b"A" * 512 + b"B" * 512,  # Two chunks
-            b"X" * 512 + b"Y" * 512,  # Both chunks different
+            b"11112222",  # Two chunks
+            b"XXXXYYYY",  # Both chunks different
             2,  # Both chunks should be fetched
-            True,
         ),
         (
             "partial_last_chunk",
-            b"A" * 512 + b"B" * 100,  # One full chunk + partial
-            b"A" * 512 + b"X" * 100,  # Partial chunk different
+            b"111122",  # One full chunk + partial
+            b"1111XX",  # Partial chunk different
             1,  # Only second chunk should be fetched
-            True,
         ),
     ],
 )
-def test_compare_and_extract_chunks(
-    setup_extractor, name, test_data, initial_data, expected_fetched_chunks, expected_success
-):
+def test_compare_and_extract_chunks(setup_extractor, name, item_data, fs_data, expected_fetched_chunks):
     """Test chunk comparison and extraction"""
     extractor, key, cache, tmpdir, create_mock_chunks, get_fetched_chunks, clear_fetched_chunks = setup_extractor
     clear_fetched_chunks()
 
-    item, target_path = create_mock_chunks(test_data, chunk_size=512)
+    chunk_size = 4
+    item, target_path = create_mock_chunks(item_data, chunk_size=chunk_size)
 
     original_chunk_ids = [chunk.id for chunk in item.chunks]
 
     # Write initial file state
     with open(target_path, "wb") as f:
-        f.write(initial_data)
+        f.write(fs_data)
 
-    result = extractor.compare_and_extract_chunks(item, target_path)
-    assert result == expected_success
+    st = os.stat(target_path)
+    result = extractor.compare_and_extract_chunks(item, target_path, st=st)  # Pass st parameter
+    assert result
 
-    if expected_success:
-        # Verify only the expected chunks were fetched
-        fetched_chunks = get_fetched_chunks()
-        assert (
-            len(fetched_chunks) == expected_fetched_chunks
-        ), f"Expected {expected_fetched_chunks} chunks to be fetched, got {len(fetched_chunks)}"
+    # Verify only the expected chunks were fetched
+    fetched_chunks = get_fetched_chunks()
+    assert len(fetched_chunks) == expected_fetched_chunks
 
-        # For single chunk changes, verify it's the correct chunk
-        if expected_fetched_chunks == 1:
-            # Find which chunk should have changed by comparing initial_data with test_data
-            for i, (orig_chunk, mod_chunk) in enumerate(
-                zip(
-                    [test_data[i : i + 512] for i in range(0, len(test_data), 512)],
-                    [initial_data[i : i + 512] for i in range(0, len(initial_data), 512)],
-                )
-            ):
-                if orig_chunk != mod_chunk:
-                    assert (
-                        fetched_chunks[0] == original_chunk_ids[i]
-                    ), f"Wrong chunk fetched. Expected chunk at position {i}"
-                    break
+    # For single chunk changes, verify it's the correct chunk
+    if expected_fetched_chunks == 1:
+        item_chunks = [item_data[i : i + chunk_size] for i in range(0, len(item_data), chunk_size)]
+        fs_chunks = [fs_data[i : i + chunk_size] for i in range(0, len(fs_data), chunk_size)]
 
-        # Verify final content
-        with open(target_path, "rb") as f:
-            assert f.read() == test_data
+        # Find which chunk should have changed by comparing item_data with fs_data
+        for i, (item_chunk, fs_chunk) in enumerate(zip(item_chunks, fs_chunks)):
+            if item_chunk != fs_chunk:
+                assert fetched_chunks[0] == original_chunk_ids[i]
+                break
+
+    # Verify final content
+    with open(target_path, "rb") as f:
+        assert f.read() == item_data
