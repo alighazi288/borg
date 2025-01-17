@@ -727,67 +727,62 @@ Duration: {0.duration}
         try:
             # First pass: Build fs chunks list
             fs_chunks = []
-            offset = 0
             with backup_io("open"):
                 fs_file = open(fs_path, "rb")
             with fs_file:
                 for chunk in item.chunks:
-                    with backup_io("seek"):
-                        fs_file.seek(offset)
                     with backup_io("read"):
                         data = fs_file.read(chunk.size)
-                    if len(data) != chunk.size:
-                        fs_chunks.append(None)
-                    else:
-                        fs_chunks.append(ChunkListEntry(id=self.key.id_hash(data), size=chunk.size))
-                    offset += chunk.size
+
+                    fs_chunks.append(ChunkListEntry(id=self.key.id_hash(data), size=len(data)))
 
             # Compare chunks and collect needed chunk IDs
             needed_chunks = []
             for fs_chunk, item_chunk in zip(fs_chunks, item.chunks):
-                if fs_chunk is None or fs_chunk.id != item_chunk.id:
+                if fs_chunk != item_chunk:
                     needed_chunks.append(item_chunk)
 
             if not needed_chunks:
                 return True
 
             # Fetch all needed chunks and iterate through ALL of them
-            chunk_data_iter = self.pipeline.fetch_many(
-                [chunk.id for chunk in needed_chunks], is_preloaded=True, ro_type=ROBJ_FILE_STREAM
-            )
+            chunk_data_iter = self.pipeline.fetch_many([chunk.id for chunk in needed_chunks], ro_type=ROBJ_FILE_STREAM)
 
-            # Second pass: Update file and consume EVERY chunk from the iterator
+            # Second pass: Update file
             offset = 0
-            item_chunk_size = 0
             with backup_io("open"):
                 fs_file = open(fs_path, "rb+")
             with fs_file:
                 for fs_chunk, item_chunk in zip(fs_chunks, item.chunks):
-                    with backup_io("seek"):
-                        fs_file.seek(offset)
-                    if fs_chunk is not None and fs_chunk.id == item_chunk.id:
+                    if fs_chunk == item_chunk:
+                        with backup_io("seek"):
+                            fs_file.seek(offset)
                         offset += item_chunk.size
-                        item_chunk_size += item_chunk.size
                     else:
                         chunk_data = next(chunk_data_iter)
-                        if pi:
-                            pi.show(increase=len(chunk_data), info=[remove_surrogates(item.path)])
+                        # Need explicit seek before write in rb+ mode to ensure correct file position Without an
+                        # explicit seek before write, the file contents got corrupted (wrote chunks in wrong positions)
+                        with backup_io("seek"):
+                            fs_file.seek(offset)
+
                         with backup_io("write"):
                             if sparse and not chunk_data.strip(b"\0"):
-                                fs_file.seek(len(chunk_data), 1)  # Seek over sparse section
+                                fs_file.write(b"\0" * len(chunk_data))  # Write zeros to overwrite old content
                                 offset += len(chunk_data)
                             else:
                                 fs_file.write(chunk_data)
                                 offset += len(chunk_data)
-                            item_chunk_size += len(chunk_data)
+                    if pi:  # <-- Moved outside to track progress in both cases
+                        pi.show(increase=len(chunk_data), info=[remove_surrogates(item.path)])
+
                 with backup_io("truncate_and_attrs"):
                     fs_file.truncate(item.size)
                     fs_file.flush()
                     self.restore_attrs(fs_path, item, fd=fs_file.fileno())
 
             # Size verification like extract_item
-            if "size" in item and item.size != item_chunk_size:
-                raise BackupError(f"Size inconsistency detected: size {item.size}, chunks size {item_chunk_size}")
+            if "size" in item and item.size != offset:
+                raise BackupError(f"Size inconsistency detected: size {item.size}, chunks size {offset}")
 
             # Damaged chunks check like extract_item
             if "chunks_healthy" in item and not item.chunks_healthy:

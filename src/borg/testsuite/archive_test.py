@@ -12,7 +12,7 @@ from ..crypto.key import PlaintextKey
 from ..archive import Archive, CacheChunkBuffer, RobustUnpacker, valid_msgpacked_dict, ITEM_KEYS, Statistics
 from ..archive import BackupOSError, backup_io, backup_io_iter, get_item_uid_gid
 from ..helpers import msgpack
-from ..item import Item, ArchiveItem
+from ..item import Item, ArchiveItem, ChunkListEntry
 from ..manifest import Manifest
 from ..platform import uid2user, gid2group, is_win32
 
@@ -437,7 +437,7 @@ def setup_extractor(tmpdir):
         for i in range(0, len(item_data), chunk_size):
             chunk_data = item_data[i : i + chunk_size]
             chunk_id = key.id_hash(chunk_data)
-            chunks.append(Mock(id=chunk_id, size=len(chunk_data)))
+            chunks.append(ChunkListEntry(id=chunk_id, size=len(chunk_data)))
             cache.objects[chunk_id] = chunk_data
 
         item = Mock(spec=["chunks", "size", "__contains__", "get"])
@@ -447,7 +447,7 @@ def setup_extractor(tmpdir):
 
         return item, str(tmpdir.join("test.txt"))
 
-    def mock_fetch_many(chunk_ids, is_preloaded=True, ro_type=None):
+    def mock_fetch_many(chunk_ids, ro_type=None):
         """Helper function to track and mock chunk fetching"""
         fetched_chunks.extend(chunk_ids)
         return iter([cache.objects[chunk_id] for chunk_id in chunk_ids])
