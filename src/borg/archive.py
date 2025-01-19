@@ -719,11 +719,10 @@ Duration: {0.duration}
                 # In this case, we *want* to extract twice, because there is no other way.
                 pass
 
-    def compare_and_extract_chunks(self, item, fs_path, st=None, *, pi=None, sparse=False):
+    def compare_and_extract_chunks(self, item, fs_path, *, pi=None, sparse=False):
         """Compare file chunks and patch if needed. Returns True if patching succeeded."""
-        if st is None or not stat.S_ISREG(st.st_mode):
+        if not os.path.exists(fs_path):
             return False
-
         try:
             # First pass: Build fs chunks list
             fs_chunks = []
@@ -742,49 +741,38 @@ Duration: {0.duration}
                 if fs_chunk != item_chunk:
                     needed_chunks.append(item_chunk)
 
-            if not needed_chunks:
-                return True
-
             # Fetch all needed chunks and iterate through ALL of them
             chunk_data_iter = self.pipeline.fetch_many([chunk.id for chunk in needed_chunks], ro_type=ROBJ_FILE_STREAM)
 
             # Second pass: Update file
-            offset = 0
             with backup_io("open"):
                 fs_file = open(fs_path, "rb+")
             with fs_file:
                 for fs_chunk, item_chunk in zip(fs_chunks, item.chunks):
                     if fs_chunk == item_chunk:
                         with backup_io("seek"):
-                            fs_file.seek(offset)
-                        offset += item_chunk.size
+                            fs_file.seek(item_chunk.size, 1)
                     else:
                         chunk_data = next(chunk_data_iter)
-                        # Need explicit seek before write in rb+ mode to ensure correct file position Without an
-                        # explicit seek before write, the file contents got corrupted (wrote chunks in wrong positions)
+
                         with backup_io("seek"):
-                            fs_file.seek(offset)
+                            fs_file.seek(fs_file.tell())
 
                         with backup_io("write"):
-                            if sparse and not chunk_data.strip(b"\0"):
-                                fs_file.write(b"\0" * len(chunk_data))  # Write zeros to overwrite old content
-                                offset += len(chunk_data)
-                            else:
-                                fs_file.write(chunk_data)
-                                offset += len(chunk_data)
-                    if pi:  # <-- Moved outside to track progress in both cases
+                            data = b"\0" * len(chunk_data) if sparse and not chunk_data.strip(b"\0") else chunk_data
+                            fs_file.write(data)
+                    if pi:
                         pi.show(increase=len(chunk_data), info=[remove_surrogates(item.path)])
 
+                final_size = fs_file.tell()
                 with backup_io("truncate_and_attrs"):
                     fs_file.truncate(item.size)
                     fs_file.flush()
                     self.restore_attrs(fs_path, item, fd=fs_file.fileno())
 
-            # Size verification like extract_item
-            if "size" in item and item.size != offset:
-                raise BackupError(f"Size inconsistency detected: size {item.size}, chunks size {offset}")
+            if "size" in item and item.size != final_size:
+                raise BackupError(f"Size inconsistency detected: size {item.size}, chunks size {final_size}")
 
-            # Damaged chunks check like extract_item
             if "chunks_healthy" in item and not item.chunks_healthy:
                 raise BackupError("File has damaged (all-zero) chunks. Try running borg check --repair.")
 

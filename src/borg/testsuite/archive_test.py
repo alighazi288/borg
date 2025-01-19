@@ -432,7 +432,6 @@ def setup_extractor(tmpdir):
     fetched_chunks = []
 
     def create_mock_chunks(item_data, chunk_size=4):
-        """Helper function to create mock chunks from archive data"""
         chunks = []
         for i in range(0, len(item_data), chunk_size):
             chunk_data = item_data[i : i + chunk_size]
@@ -441,23 +440,20 @@ def setup_extractor(tmpdir):
             cache.objects[chunk_id] = chunk_data
 
         item = Mock(spec=["chunks", "size", "__contains__", "get"])
-        item.chunks = chunks  # Use actual list for chunks
+        item.chunks = chunks
         item.size = len(item_data)
         item.__contains__ = lambda self, item: item == "size"
 
         return item, str(tmpdir.join("test.txt"))
 
     def mock_fetch_many(chunk_ids, ro_type=None):
-        """Helper function to track and mock chunk fetching"""
         fetched_chunks.extend(chunk_ids)
         return iter([cache.objects[chunk_id] for chunk_id in chunk_ids])
 
     def clear_fetched_chunks():
-        """Helper function to clear tracked chunks between tests"""
         fetched_chunks.clear()
 
     def get_fetched_chunks():
-        """Helper function to get the list of fetched chunks"""
         return fetched_chunks
 
     cache.fetch_many = mock_fetch_many
@@ -510,6 +506,30 @@ def setup_extractor(tmpdir):
             b"1111XX",  # Partial chunk different
             1,  # Only second chunk should be fetched
         ),
+        (
+            "fs_file_shorter",
+            b"11112222",  # Two chunks in archive
+            b"111122",  # Shorter on disk - missing part of second chunk
+            1,  # Should fetch second chunk
+        ),
+        (
+            "fs_file_longer",
+            b"11112222",  # Two chunks in archive
+            b"1111222233",  # Longer on disk
+            0,  # Should fetch no chunks since content matches up to archive length
+        ),
+        (
+            "empty_archive_file",
+            b"",  # Empty in archive
+            b"11112222",  # Content on disk
+            0,  # No chunks to compare = no chunks to fetch
+        ),
+        (
+            "empty_fs_file",
+            b"11112222",  # Two chunks in archive
+            b"",  # Empty on disk
+            2,  # Should fetch all chunks since file is empty
+        ),
     ],
 )
 def test_compare_and_extract_chunks(setup_extractor, name, item_data, fs_data, expected_fetched_chunks):
@@ -522,15 +542,12 @@ def test_compare_and_extract_chunks(setup_extractor, name, item_data, fs_data, e
 
     original_chunk_ids = [chunk.id for chunk in item.chunks]
 
-    # Write initial file state
     with open(target_path, "wb") as f:
         f.write(fs_data)
 
-    st = os.stat(target_path)
-    result = extractor.compare_and_extract_chunks(item, target_path, st=st)  # Pass st parameter
+    result = extractor.compare_and_extract_chunks(item, target_path)
     assert result
 
-    # Verify only the expected chunks were fetched
     fetched_chunks = get_fetched_chunks()
     assert len(fetched_chunks) == expected_fetched_chunks
 
@@ -545,6 +562,5 @@ def test_compare_and_extract_chunks(setup_extractor, name, item_data, fs_data, e
                 assert fetched_chunks[0] == original_chunk_ids[i]
                 break
 
-    # Verify final content
     with open(target_path, "rb") as f:
         assert f.read() == item_data
